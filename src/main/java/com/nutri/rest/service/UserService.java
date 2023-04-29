@@ -1,0 +1,580 @@
+package com.nutri.rest.service;
+
+import com.nutri.rest.exception.EntityNotFoundException;
+import com.nutri.rest.exception.ValidationException;
+import com.nutri.rest.mapper.AuditLoggingMapper;
+import com.nutri.rest.mapper.UserMapper;
+import com.nutri.rest.model.*;
+import com.nutri.rest.repository.*;
+import com.nutri.rest.request.*;
+import com.nutri.rest.response.CaptchaResponse;
+import com.nutri.rest.response.JwtResponse;
+import com.nutri.rest.response.ResetPasswordResponse;
+import com.nutri.rest.response.UserResponse;
+import com.nutri.rest.security.JwtUtils;
+import com.nutri.rest.security.SSOUser;
+import com.nutri.rest.utils.AppUtils;
+import com.nutri.rest.utils.UserRoles;
+import io.jsonwebtoken.Jwts;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.BadCredentialsException;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.util.CollectionUtils;
+import org.springframework.util.StringUtils;
+
+import javax.servlet.http.HttpServletRequest;
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.security.SecureRandom;
+import java.text.DecimalFormat;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
+
+@Service
+public class UserService implements UserDetailsService {
+
+  private final UserRepository userRepository;
+
+  private final AuthenticationManager authenticationManager;
+  private final JwtUtils jwtUtils;
+  private final LogoutTokensRepository logoutTokensRepository;
+
+  private final AuditLoggingRepository auditLoggingRepository;
+  private final MailService mailService;
+  private final OTPService otpService;
+  private final RoleRepository roleRepository;
+  private final LookupRepository lookupRepository;
+
+  private final DietitianRecognitionsRepository dietitianRecognitionsRepository;
+
+  private final DietitianExperienceDetailsRepository dietitianExperienceDetailsRepository;
+  private final DietitianProfileRepository dietitianProfileRepository;
+  private final RestaurantProfileRepository restaurantProfileRepository;
+  private final DietitianExtraEducationDetailsRepository dietitianExtraEducationDetailsRepository;
+
+  @Value("${bezkoder.app.jwtSecret}")
+  private String jwtSecret;
+
+  private static final Logger logger = LoggerFactory.getLogger(UserDetailsService.class);
+
+  public UserService(
+          UserRepository userRepository,
+          AuthenticationManager authenticationManager,
+          JwtUtils jwtUtils,
+          LogoutTokensRepository logoutTokensRepository, AuditLoggingRepository auditLoggingRepository, MailService mailService, OTPService otpService, RoleRepository roleRepository, LookupRepository lookupRepository, DietitianRecognitionsRepository dietitianRecognitionsRepository, DietitianExperienceDetailsRepository dietitianExperienceDetailsRepository, DietitianProfileRepository dietitianProfileRepository, RestaurantProfileRepository restaurantProfileRepository, DietitianExtraEducationDetailsRepository dietitianExtraEducationDetailsRepository) {
+    this.userRepository = userRepository;
+    this.authenticationManager = authenticationManager;
+    this.jwtUtils = jwtUtils;
+    this.logoutTokensRepository = logoutTokensRepository;
+    this.auditLoggingRepository = auditLoggingRepository;
+    this.mailService = mailService;
+    this.otpService = otpService;
+    this.roleRepository = roleRepository;
+    this.lookupRepository = lookupRepository;
+    this.dietitianRecognitionsRepository = dietitianRecognitionsRepository;
+    this.dietitianExperienceDetailsRepository = dietitianExperienceDetailsRepository;
+    this.dietitianProfileRepository = dietitianProfileRepository;
+    this.restaurantProfileRepository = restaurantProfileRepository;
+    this.dietitianExtraEducationDetailsRepository = dietitianExtraEducationDetailsRepository;
+  }
+
+  public JwtResponse authenticateUser(LoginRequest loginRequest, HttpServletRequest request) {
+    /*Password should be changed for every 30 days*/
+    /*boolean captchaVerified = captchaService.verify(loginRequest.getRecaptchaResponse());
+    if(!captchaVerified)
+      throw new ValidationException("Invalid Captcha");*/
+
+    /*boolean captchaVerified = this.validateCaptcha(loginRequest.getCaptchaId(), loginRequest.getCaptchaResponse());
+    if (!captchaVerified)
+      throw new ValidationException("Invalid Captcha");*/
+
+    Optional<User> userDetails = userRepository.findByUserName(loginRequest.getUserName());
+    if(userDetails.isPresent() && userDetails.get().getInvalidAttempts()>5) {
+      if(this.checkTimeToUnlockUser(userDetails.get().getLastModifiedDate())) {
+        User user = userDetails.get();
+        user.setInvalidAttempts(0);
+        userRepository.save(user);
+      }
+      else
+        throw new ValidationException("Maximum invalid attempts reached!! User locked");
+    }
+    if(userDetails.isPresent() && userDetails.get()!=null){
+      LocalDate passwordUpdatedDate = userDetails.get().getPasswordUpdateDate();
+      if(passwordUpdatedDate == null || LocalDate.now().minusDays(30).isAfter(passwordUpdatedDate)){
+        throw new ValidationException("Password is expired! Kindly change it now");
+      }
+    }
+
+    Authentication authentication = new UsernamePasswordAuthenticationToken(
+            loginRequest.getUserName(), loginRequest.getPassword());
+    try {
+      authentication =
+              authenticationManager.authenticate(authentication);
+    }catch (BadCredentialsException e){
+      if(userDetails.isPresent()) {
+        User user = userDetails.get();
+        user.setInvalidAttempts(user.getInvalidAttempts() + 1);
+        userRepository.save(user);
+      }
+      throw new ValidationException("The username or password is invalid");
+    }
+    SSOUser user = (SSOUser) authentication.getPrincipal();
+    AtomicBoolean userTypeExists = new AtomicBoolean(false);
+    user.getAuthorities().stream().forEach(grantedAuthority -> {
+      if(grantedAuthority.getAuthority().equals(loginRequest.getUserType()))
+        userTypeExists.set(true);
+    });
+    if(!userTypeExists.get())
+      throw new ValidationException("Invalid Type of user selected");
+
+    SecurityContextHolder.getContext().setAuthentication(authentication);
+    String jwt = jwtUtils.generateJwtToken(authentication);
+    List<AuditLogging> auditLoggings = this.auditLoggingRepository.findByUserNameAndLogoutTimeIsNull(loginRequest.getUserName());
+    if(!(auditLoggings.isEmpty())) {
+      for (AuditLogging auditLogging : auditLoggings) {
+//        this.invalidateToken(auditLogging.getToken());
+        auditLogging.setLogoutTime(new Date());
+        auditLoggingRepository.save(auditLogging);
+//        Date tokenExpiryTime = Jwts.parser().setSigningKey(jwtSecret).parseClaimsJws(auditLogging.getToken()).getBody().getExpiration();
+        this.logoutTokensRepository.save(LogoutTokens.builder()
+                .token(auditLogging.getToken())
+                .tokenExpiryTime(new Date())
+                .userName(loginRequest.getUserName()).build());
+      }
+    }
+    this.auditLoggingRepository.save(AuditLoggingMapper.mapAuditLogging(loginRequest, jwt, request.getRemoteAddr()));
+
+    String userProfileImage = userDetails.get().getProfileImage()!=null ? new String(userDetails.get().getProfileImage()) : null;
+    List<Role> roles = (List<Role>) userDetails.get().getRoles();
+    return JwtResponse.builder()
+        .token(jwt)
+        .id(user.getId())
+        .userName(user.getUsername())
+        .userProfileActivated(user.getUserProfileActivated())
+        .nameOfUser(user.getNameOfUser())
+        .role(((List)user.getAuthorities()).get(0).toString())
+        .userProfileImage(UserRoles.ROLE_RESTAURANT.equals(roles.get(0).getCodeName())?
+                            (userDetails.get().getRestaurantProfile()!=null ?
+                                userDetails.get().getRestaurantProfile().getRestaurantImage()!=null ? new String(userDetails.get().getRestaurantProfile().getRestaurantImage()) : null
+                                : null) :
+                            (userDetails.get().getProfileImage()!=null ? new String(userDetails.get().getProfileImage()) : null))
+        .build();
+  }
+
+  //Unlock user after 30 mins
+  public boolean checkTimeToUnlockUser(Date lastUpdateDate){
+    Calendar cal = Calendar.getInstance();
+// remove next line if you're always using the current time.
+    cal.setTime(new Date());
+    cal.add(Calendar.MINUTE, -30);
+    Date thirtyMinsBack = cal.getTime();
+
+    if(lastUpdateDate.compareTo(thirtyMinsBack) == 1)
+      return false;
+    else
+      return true;
+  }
+
+  //generateCaptcha
+  public CaptchaResponse generateCaptcha(){
+    SecureRandom random = new SecureRandom();
+    byte sessBytes[] = new byte[32];
+    random.nextBytes(sessBytes);
+    int randInRange = random.nextInt(20);
+    return CaptchaResponse.builder()
+            .id(randInRange)
+            .captcha(AppUtils.captchaValues.get(randInRange))
+            .build();
+  }
+
+  //Validate captcha
+  public boolean validateCaptcha(int id, String result){
+    try {
+      if(result!=null && result.equalsIgnoreCase(AppUtils.captchaResults.get(id)))
+        return true;
+    }catch (Exception e){
+      logger.error(e.getMessage());
+    }
+    return false;
+  }
+
+  public void logout(HttpServletRequest request){
+    String token = request.getHeader("Authorization");
+    this.invalidateToken(token);
+  }
+
+  public void invalidateToken(String token){
+    token = token.substring(7, token.length());
+    String username = this.jwtUtils.getUserNameFromJwtToken(token);
+    Date tokenExpiryTime = Jwts.parser().setSigningKey(jwtSecret).parseClaimsJws(token).getBody().getExpiration();
+
+    AuditLogging auditLogging = this.auditLoggingRepository.findByToken(token);
+    if(auditLogging!=null) {
+      auditLogging.setLogoutTime(new Date());
+      auditLoggingRepository.save(auditLogging);
+    }
+
+    this.logoutTokensRepository.save(LogoutTokens.builder()
+            .token(token)
+            .tokenExpiryTime(tokenExpiryTime)
+            .userName(username).build());
+  }
+
+  public UserResponse getUser(String userName) {
+    User user =
+        userRepository
+            .findByUserName(userName)
+            .orElseThrow(
+                () -> new UsernameNotFoundException("User Not Found with username: " + userName));
+    List<DietitianRecognitions> dietitianRecognitionsList = dietitianRecognitionsRepository.findByUserId(user);
+    List<DietitianExperienceDetails> dietitianExperienceDetails = dietitianExperienceDetailsRepository.findByUserId(user);
+    List<DietitianExtraEducationDetails> extraEducationDetails = null;
+    if(user.getProfile()!=null) {
+       extraEducationDetails = dietitianExtraEducationDetailsRepository.findByDietitianProfileId(user.getProfile());
+    }
+    return UserMapper.mapFromUserDomainToResponseAlongWithProfile(user, dietitianRecognitionsList, dietitianExperienceDetails, extraEducationDetails);
+  }
+
+  public Page<UserResponse> getAllUsers(Pageable pageable) {
+    return userRepository.findAll(pageable)
+        .map(UserMapper::mapFromUserDomainToResponse);
+  }
+
+  public List<UserResponse> getAllUsersByList() {
+    return userRepository.findAll().stream()
+            .map(UserMapper::mapFromUserDomainToResponse).collect(Collectors.toList());
+  }
+
+  public User getUserInternal(String userName) {
+    return userRepository
+        .findByUserName(userName)
+        .orElseThrow(
+            () -> new UsernameNotFoundException("User Not Found with username:" + userName));
+  }
+
+  @Override
+  public UserDetails loadUserByUsername(String userName) {
+    User user =
+        userRepository
+            .findByUserName(userName)
+            .orElseThrow(
+                () -> new UsernameNotFoundException("User Not Found with username: " + userName));
+    return SSOUser.build(user);
+  }
+
+  public UserResponse createUser(CreateUserRequest createUserRequest) {
+    String encryptedPassword =
+        new BCryptPasswordEncoder(4, new SecureRandom(jwtSecret.getBytes()))
+            .encode(createUserRequest.getPassword());
+    Optional<User> userPresent = userRepository.findByUserName(createUserRequest.getUserName());
+    if(userPresent.isPresent())
+      throw new ValidationException("Email already registered!! Try with a different mail");
+
+    userPresent = userRepository.findByPhoneNumber(createUserRequest.getPhoneNumber());
+    if(userPresent.isPresent())
+      throw new ValidationException("Mobile Number already used!! Try with a different number");
+
+    if(createUserRequest.getUserType().equals(UserRoles.ROLE_RESTAURANT.name())){
+      if(restaurantProfileRepository.findByRestaurantName(createUserRequest.getRestaurantName())!=null)
+        throw new ValidationException("Restaurant Name already used!! Try with a different name");;
+    }
+
+    RestaurantProfile restaurantProfile = RestaurantProfile.builder()
+            .restaurantName(createUserRequest.getRestaurantName()).build();
+
+    User user = UserMapper.mapFromUserRequestToDomain(
+            encryptedPassword, createUserRequest);
+    user.setRestaurantProfile(restaurantProfileRepository.save(restaurantProfile));
+    if (!StringUtils.isEmpty(createUserRequest.getUserType())) {
+      List<Role> roles = roleRepository.findByCodeName(createUserRequest.getUserType());
+      user.setRoles(roles);
+    }
+    return UserMapper.mapFromUserDomainToResponse(
+        userRepository.save(user));
+  }
+
+  public UserResponse updateUser(String userName, UpdateUserRequest updateUserRequest) throws IOException {
+    User user =
+        userRepository
+            .findByUserName(userName)
+            .orElseThrow(
+                () -> new EntityNotFoundException("User Not Found with username: " + userName));
+    if (updateUserRequest.getRoles() != null && updateUserRequest.getRoles().size() > 0) {
+      user.setRoles(updateUserRequest.getRoles());
+    }
+    /*if (updateUserRequest.getPassword() != null) {
+      String encryptedPassword =
+          new BCryptPasswordEncoder(4, new SecureRandom(jwtSecret.getBytes()))
+              .encode(updateUserRequest.getPassword());
+
+      *//* last password should not be set again *//*
+      Optional<User> userPreviousDetails = userRepository.findByUserName(userName);
+      if(encryptedPassword.equals(userPreviousDetails.get().getPassword()))
+        throw new ValidationException("Password should not be same as previous password");
+
+      user.setPassword(encryptedPassword);
+      user.setPasswordUpdateDate(LocalDate.now());
+    }*/
+    if (updateUserRequest.getPhoneNumber() != null) {
+      user.setPhoneNumber(updateUserRequest.getPhoneNumber());
+    }
+
+    return UserMapper.mapFromUserDomainToResponse(userRepository.save(user));
+  }
+
+  public UserResponse updateUserProfileRequest(String userName, UpdateUserProfileRequest updateUserProfileRequest){
+    User user = userRepository
+                    .findByUserName(userName)
+                    .orElseThrow(
+                            () -> new EntityNotFoundException("User Not Found with username: " + userName));
+    if (updateUserProfileRequest.getPhoneNumber() != null) {
+      user.setPhoneNumber(updateUserProfileRequest.getPhoneNumber());
+    }
+    if(updateUserProfileRequest.getFirstName() != null)
+      user.setFirstName(updateUserProfileRequest.getFirstName());
+    if(updateUserProfileRequest.getLastName() != null)
+      user.setLastName(updateUserProfileRequest.getLastName());
+    if(updateUserProfileRequest.getPrice() != null)
+      user.setBasePrice(new BigDecimal(updateUserProfileRequest.getPrice()));
+    if(updateUserProfileRequest.getRestaurantImage()!=null)
+      user.setProfileImage(updateUserProfileRequest.getRestaurantImage().getBytes());
+    if(!StringUtils.isEmpty(updateUserProfileRequest.getQualifiedDegree()))
+      updateDietitianProfile(user, updateUserProfileRequest);
+    if(!StringUtils.isEmpty(updateUserProfileRequest.getAvgCost()))
+      updateRestaurantProfile(user, updateUserProfileRequest);
+
+//    user.setUserProfileActivated("Y");
+
+    return UserMapper.mapFromUserDomainToResponse(userRepository.save(user));
+  }
+
+  private void updateRestaurantProfile(User user, UpdateUserProfileRequest updateUserProfileRequest){
+    RestaurantProfile restaurantProfile = user.getRestaurantProfile();
+    if (restaurantProfile == null) {
+      restaurantProfile = RestaurantProfile.builder().build();
+    }
+
+    restaurantProfile.setRestaurantName(updateUserProfileRequest.getRestaurantName());
+    restaurantProfile.setBio(updateUserProfileRequest.getBio());
+    restaurantProfile.setAddress(updateUserProfileRequest.getAddress());
+    restaurantProfile.setAvgCost(updateUserProfileRequest.getAvgCost());
+    restaurantProfile.setRestaurantImage(updateUserProfileRequest.getRestaurantImage()!=null ? updateUserProfileRequest.getRestaurantImage().getBytes() : null);
+
+    List<LookupValue> cuisines = updateUserProfileRequest.getCuisines().stream().map(cuisine ->
+            lookupRepository.findByLookupValueCode(cuisine.getUnitLookupCode())).collect(Collectors.toList());
+    restaurantProfile.setCuisines(cuisines);
+
+    restaurantProfileRepository.save(restaurantProfile);
+  }
+
+  private void updateDietitianProfile(User user, UpdateUserProfileRequest updateUserProfileRequest){
+
+    DietitianProfile profile = user.getProfile();
+    if (profile == null) {
+      profile = DietitianProfile.builder().build();
+    }
+    profile.setTitle(updateUserProfileRequest.getTitle());
+    profile.setOverallExperience(updateUserProfileRequest.getOverallExperience());
+    profile.setSpecialistExperience(updateUserProfileRequest.getSpecialistExperience());
+    LookupValue qualifiedDegree = lookupRepository.findByLookupValueCode(updateUserProfileRequest.getQualifiedDegree().getUnitLookupCode());
+    profile.setQualifiedDegree(qualifiedDegree);
+    profile.setDegreeUniversity(updateUserProfileRequest.getDegreeUniversity());
+    profile.setDegreeYear(updateUserProfileRequest.getDegreeYear());
+    profile.setBio(updateUserProfileRequest.getBio());
+    profile.setAddress(updateUserProfileRequest.getAddress());
+
+    List<LookupValue> services = updateUserProfileRequest.getServices().stream().map(service ->
+            lookupRepository.findByLookupValueCode(service.getUnitLookupCode())).collect(Collectors.toList());
+    profile.setServices(services);
+    profile = dietitianProfileRepository.save(profile);
+    user.setProfile(profile);
+
+    if(!CollectionUtils.isEmpty(updateUserProfileRequest.getExtraEducationDetails())){
+      DietitianProfile finalProfile = profile;
+      updateUserProfileRequest.getExtraEducationDetails().stream().forEach(dietitianEducationDetails -> {
+        LookupValue degreeLookupValue = lookupRepository.findByLookupValueCode(dietitianEducationDetails.getQualifiedDegree().getUnitLookupCode());
+        DietitianExtraEducationDetails educationDetails = dietitianExtraEducationDetailsRepository.findByDietitianProfileIdAndQualifiedDegree(finalProfile, degreeLookupValue);
+        if (educationDetails != null) {
+          educationDetails.setDegreeUniversity(dietitianEducationDetails.getDegreeUniversity());
+          educationDetails.setDegreeYear(dietitianEducationDetails.getDegreeYear());
+        }else {
+          educationDetails = DietitianExtraEducationDetails.builder()
+                  .dietitianProfileId(finalProfile)
+                  .qualifiedDegree(degreeLookupValue)
+                  .degreeUniversity(dietitianEducationDetails.getDegreeUniversity())
+                  .degreeYear(dietitianEducationDetails.getDegreeYear())
+                  .build();
+        }
+        dietitianExtraEducationDetailsRepository.save(educationDetails);
+      });
+    }
+
+    if(!CollectionUtils.isEmpty(updateUserProfileRequest.getExperienceDetails())){
+      dietitianExperienceDetailsRepository.findByUserId(user).stream().forEach(experience -> dietitianExperienceDetailsRepository.deleteById(experience.getId()));
+      updateUserProfileRequest.getExperienceDetails().stream().forEach(experienceDetails -> {
+        if(!StringUtils.isEmpty(experienceDetails.getOrganization())) {
+          DietitianExperienceDetails dietitianExperienceDetails = DietitianExperienceDetails.builder()
+                  .userId(user)
+                  .organization(experienceDetails.getOrganization())
+                  .fromYear(experienceDetails.getFromYear())
+                  .toYear(experienceDetails.getToYear())
+                  .build();
+          dietitianExperienceDetailsRepository.save(dietitianExperienceDetails);
+        }
+      });
+    }
+
+    if(!CollectionUtils.isEmpty(updateUserProfileRequest.getRecognitions())){
+      dietitianRecognitionsRepository.findByUserId(user).stream().forEach(recognition -> dietitianRecognitionsRepository.deleteById(recognition.getId()));
+      updateUserProfileRequest.getRecognitions().stream().forEach(recognition -> {
+        if(!StringUtils.isEmpty(recognition.getAwardsOrRecognitions())) {
+          DietitianRecognitions dietitianRecognitions = DietitianRecognitions.builder()
+                  .userId(user)
+                  .awardsOrRecognitions(recognition.getAwardsOrRecognitions())
+                  .yearOfRecognition(recognition.getYearOfRecognition())
+                  .build();
+          dietitianRecognitionsRepository.save(dietitianRecognitions);
+        }
+      });
+    }
+
+    List<DietitianRecognitions> recognitions = dietitianRecognitionsRepository.findByUserId(user);
+    recognitions.forEach(recognition -> dietitianRecognitionsRepository.deleteById(recognition.getId()));
+    if (!CollectionUtils.isEmpty(updateUserProfileRequest.getRecognitions())) {
+      recognitions = updateUserProfileRequest.getRecognitions().stream().map(recognition ->
+              DietitianRecognitions.builder()
+                      .userId(user)
+                      .awardsOrRecognitions(recognition.getAwardsOrRecognitions())
+                      .yearOfRecognition(recognition.getYearOfRecognition()).build()).collect(Collectors.toList());
+      dietitianRecognitionsRepository.saveAll(recognitions);
+    }
+
+    List<DietitianExperienceDetails> dietitianExperienceDetails = dietitianExperienceDetailsRepository.findByUserId(user);
+    dietitianExperienceDetails.forEach(experience -> dietitianExperienceDetailsRepository.deleteById(experience.getId()));
+
+    if (!CollectionUtils.isEmpty(updateUserProfileRequest.getExperienceDetails())) {
+      dietitianExperienceDetails = updateUserProfileRequest.getExperienceDetails().stream().map(experience ->
+              DietitianExperienceDetails.builder()
+                      .userId(user)
+                      .fromYear(experience.getFromYear())
+                      .toYear(experience.getToYear())
+                      .organization(experience.getOrganization()).build()).collect(Collectors.toList());
+      dietitianExperienceDetailsRepository.saveAll(dietitianExperienceDetails);
+    }
+  }
+
+  public UserResponse updatePassword(String userName, UpdateUserPwdRequest updateUserRequest, HttpServletRequest request) {
+//    String userName = updateUserRequest.getUsername();
+    User user =
+            userRepository
+                    .findByUserName(userName)
+                    .orElseThrow(
+                            () -> new EntityNotFoundException("User Not Found with username: " + userName));
+    if (updateUserRequest.getPassword() != null) {
+      String encryptedPassword =
+              new BCryptPasswordEncoder(4, new SecureRandom(jwtSecret.getBytes()))
+                      .encode(updateUserRequest.getPassword());
+
+      /* last password should not be set again */
+      Optional<User> userPreviousDetails = userRepository.findByUserName(userName);
+      if (encryptedPassword.equals(userPreviousDetails.get().getPassword()))
+        throw new ValidationException("Password should not be same as previous password");
+
+      user.setPassword(encryptedPassword);
+      user.setPasswordUpdateDate(LocalDate.now());
+      //user.setExtPassword(updateUserRequest.getPassword());
+      //changeExternalPassword(user,updateUserRequest.getPassword());
+    }
+    return UserMapper.mapFromUserDomainToResponse(userRepository.save(user));
+  }
+
+  public ResetPasswordResponse resetPasswordRequest(ResetPasswordRequest resetPasswordRequest) {
+    User user =
+        userRepository
+            .findByUserName(resetPasswordRequest.getUserName())
+            .orElseThrow(
+                () -> new EntityNotFoundException("User Not Found with username: " + resetPasswordRequest.getUserName()));
+    List<Role> roles = (List<Role>) user.getRoles();
+    if(!resetPasswordRequest.getPhoneNumber().equals(user.getPhoneNumber()))
+      throw new ValidationException("Invalid mobile number");
+    else if(!resetPasswordRequest.getUserType().equals(roles.get(0).getCodeName()))
+      throw new ValidationException("Invalid user type");
+    SecureRandom random = new SecureRandom();
+    byte sessBytes[] = new byte[32];
+    random.nextBytes(sessBytes);
+    int randInRange = random.nextInt(999999);
+    String otp= new DecimalFormat("000000").format(randInRange);
+
+    return ResetPasswordResponse.builder()
+        .response(mailService.sendResetMail(user.getUserName(), otp, user))
+        .build();
+  }
+
+  public ResetPasswordResponse otpResetPasswordRequest(String userName) {
+    User user =
+            userRepository
+                    .findByUserName(userName)
+                    .orElseThrow(
+                            () -> new EntityNotFoundException("User Not Found with username: " + userName));
+    if(user.getPhoneNumber()==null || user.getPhoneNumber().equals("")){
+      throw new ValidationException("Mobile number not registered ! please contact administrator!");
+    }
+    return ResetPasswordResponse.builder()
+            .response(otpService.generateOTP(user.getUserName(), user.getPhoneNumber()))
+            .sentTo("XXXXXX" + user.getPhoneNumber().substring(6, 10))
+            .build();
+  }
+
+  public ResetPasswordResponse validateOTP(String userName,String otpInput){
+    OTP otp=otpService.findByUserName(userName);
+    if(otpInput.equals(otp.getOtp())){
+      if(otp.getExpiryTime().isAfter(LocalDateTime.now())) {
+        return new ResetPasswordResponse(jwtUtils.generateJwtToken(userName), "");
+      }else {
+        throw new ValidationException("OTP expired");
+      }
+    }else{
+      throw new ValidationException("Invalid OTP");
+    }
+  }
+
+  public UserResponse deleteUser(String userName){
+    User user =
+            userRepository
+                    .findByUserName(userName)
+                    .orElseThrow(
+                            () -> new EntityNotFoundException("User Not Found with username: " + userName));
+     userRepository.deleteById(user.getId());
+     return UserMapper.mapFromUserDomainToResponse(user);
+  }
+
+  public String encryptUserPassword(){
+    List<User> users=userRepository.findAll();
+    int count=0;
+    for(User user:users){
+      String encryptedPassword =
+              new BCryptPasswordEncoder(4, new SecureRandom(jwtSecret.getBytes()))
+                      .encode(user.getPassword());
+      user.setPassword(encryptedPassword);
+      userRepository.save(user);
+      count++;
+    }
+    return "password updated for"+count;
+  }
+
+}
